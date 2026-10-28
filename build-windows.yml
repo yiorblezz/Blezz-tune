@@ -1,0 +1,23 @@
+name: Compilar BLEZZ TUNE (VST3 Windows)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar
+        run: cmake -B build -A x64
+
+      - name: Compilar
+        run: cmake --build build --config Release --parallel
+
+      - name: Subir el plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLEZZ-TUNE-VST3-Windows
+          path: build/BlezzTune_artefacts/Release/VST3/
