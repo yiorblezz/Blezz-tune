@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(BlezzTune VERSION 1.0.0)
+project(BlezzTune VERSION 2.0.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,9 +19,9 @@ endif()
 juce_add_plugin(BlezzTune
     COMPANY_NAME "Yiorblezz"
     PLUGIN_MANUFACTURER_CODE Yblz
-    PLUGIN_CODE Bztn
+    PLUGIN_CODE Bzt2
     FORMATS VST3
-    PRODUCT_NAME "BLEZZ TUNE"
+    PRODUCT_NAME "BLEZZ TUNE V2"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT FALSE
     NEEDS_MIDI_OUTPUT FALSE

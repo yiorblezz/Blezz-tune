@@ -22,13 +22,19 @@ APVTS::ParameterLayout BlezzTuneProcessor::createLayout()
     auto db  = AudioParameterFloatAttributes().withLabel ("dB");
 
     l.add (std::make_unique<AudioParameterBool>   (ParameterID { "tuneOn", 1 }, "Tune On", true));
+    l.add (std::make_unique<AudioParameterChoice> (ParameterID { "mode", 1 }, "Modo",
+                                                   StringArray { "Estudio", "Tiempo Real" }, 0));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "key", 1 }, "Key", keyNames(), 0));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "scale", 1 }, "Scale", scaleNames(), 2));
     l.add (std::make_unique<AudioParameterFloat>  (ParameterID { "retune", 1 }, "Retune Speed",
-                                                   NormalisableRange<float> (0.0f, 400.0f, 1.0f, 0.4f), 25.0f,
+                                                   NormalisableRange<float> (0.0f, 400.0f, 1.0f, 0.4f), 20.0f,
                                                    AudioParameterFloatAttributes().withLabel ("ms")));
     l.add (std::make_unique<AudioParameterFloat>  (ParameterID { "humanize", 1 }, "Humanize",
-                                                   NormalisableRange<float> (0.0f, 100.0f, 1.0f), 30.0f, pct));
+                                                   NormalisableRange<float> (0.0f, 100.0f, 1.0f), 25.0f, pct));
+    l.add (std::make_unique<AudioParameterFloat>  (ParameterID { "flex", 1 }, "Flex Tune",
+                                                   NormalisableRange<float> (0.0f, 100.0f, 1.0f), 0.0f, pct));
+    l.add (std::make_unique<AudioParameterFloat>  (ParameterID { "vibrato", 1 }, "Vibrato",
+                                                   NormalisableRange<float> (0.0f, 100.0f, 1.0f), 0.0f, pct));
 
     l.add (std::make_unique<AudioParameterBool>   (ParameterID { "fetOn", 1 }, "FET 76 On", true));
     l.add (std::make_unique<AudioParameterFloat>  (ParameterID { "fetIn", 1 }, "FET Input",
@@ -61,6 +67,8 @@ BlezzTuneProcessor::BlezzTuneProcessor()
                         .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "PARAMS", createLayout())
 {
+    for (auto& h : histIn)  h = -1.0f;
+    for (auto& h : histOut) h = -1.0f;
 }
 
 bool BlezzTuneProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -75,15 +83,16 @@ void BlezzTuneProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     fs = sampleRate;
     const int ch = std::max (1, getTotalNumOutputChannels());
     tracker.prepare (fs);
-    shifter.prepare (ch, (int) (0.08 * fs));
+    psola.setRealtime (apvts.getRawParameterValue ("mode")->load() > 0.5f);
+    psola.prepare (fs, ch);
     fet.prepare (fs);
     opto.prepare (fs);
     bright.prepare (fs, ch, samplesPerBlock);
-    grainLen = grainTarget = 0.03 * fs;
-    shift = desiredShift = 0.0f; wetAmount = 0.0f;
-    detectedMidi = -1.0f; targetNote = -1; heldSeconds = 0.0;
+    voiced = false; detectedMidi = midiSlow = -1.0f; period = 0.0f;
+    targetNote = -1; heldSeconds = 0.0; shift = desiredShift = 0.0f;
+    tuneMix = apvts.getRawParameterValue ("tuneOn")->load() > 0.5f ? 1.0f : 0.0f;
     lastKey = lastScale = -1;
-    setLatencySamples (0);
+    setLatencySamples (psola.getLatency());   // FL Studio compensa este retraso automáticamente
 }
 
 void BlezzTuneProcessor::updateScaleMask()
@@ -103,6 +112,7 @@ void BlezzTuneProcessor::updateScaleMask()
     };
     for (auto& m : scaleMask) m = false;
     for (int i : intervals[juce::jlimit (0, 5, scale)]) scaleMask[(key + i) % 12] = true;
+    for (int i = 0; i < 12; ++i) scaleMaskUi[(size_t) i] = scaleMask[i];
     targetNote = -1;
 }
 
@@ -116,9 +126,9 @@ int BlezzTuneProcessor::nearestScaleNote (float midi) const
         const float d = std::abs (midi - (float) n);
         if (d < bestDist) { bestDist = d; best = n; }
     }
-    // histéresis: no saltar de nota por un vibrato pequeño
+    // histéresis: un vibrato o un deslizamiento corto no cambia la nota objetivo
     if (targetNote >= 0 && scaleMask[((targetNote % 12) + 12) % 12]
-        && std::abs (midi - (float) targetNote) < bestDist + 0.12f)
+        && std::abs (midi - (float) targetNote) < bestDist + 0.15f)
         return targetNote;
     return best;
 }
@@ -126,15 +136,23 @@ int BlezzTuneProcessor::nearestScaleNote (float midi) const
 void BlezzTuneProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
-    const int numCh = buffer.getNumChannels();
+    const int numCh = std::min (2, buffer.getNumChannels());
     const int n = buffer.getNumSamples();
     for (int c = getTotalNumInputChannels(); c < getTotalNumOutputChannels(); ++c) buffer.clear (c, 0, n);
     if (numCh == 0) return;
 
     updateScaleMask();
+    const bool realtime = apvts.getRawParameterValue ("mode")->load() > 0.5f;
+    if (realtime != psola.isRealtime())
+    {
+        psola.setRealtime (realtime);
+        setLatencySamples (psola.getLatency());
+    }
     const bool  tuneOn   = apvts.getRawParameterValue ("tuneOn")->load() > 0.5f;
-    const float retune   = apvts.getRawParameterValue ("retune")->load();
+    const float retuneMs = apvts.getRawParameterValue ("retune")->load();
     const float humanize = apvts.getRawParameterValue ("humanize")->load() / 100.0f;
+    const float flex     = apvts.getRawParameterValue ("flex")->load() / 100.0f;
+    const float vibAmt   = apvts.getRawParameterValue ("vibrato")->load() / 100.0f;
     const bool  fetOn    = apvts.getRawParameterValue ("fetOn")->load() > 0.5f;
     const bool  optoOn   = apvts.getRawParameterValue ("optoOn")->load() > 0.5f;
 
@@ -145,16 +163,16 @@ void BlezzTuneProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
                     apvts.getRawParameterValue ("optoMode")->load() > 0.5f);
     bright.setAmount (apvts.getRawParameterValue ("brillo")->load() / 100.0f);
 
+    // Retune: 0 ms = salto instantáneo (efecto T-Pain / trap). Humanize alarga el tiempo en notas sostenidas.
     auto shiftCoeff = [&]
     {
-        if (targetNote < 0) return blezz::coeffForTime (0.04, fs);
-        const double held01 = juce::jlimit (0.0, 1.0, (heldSeconds - 0.15) / 0.3);
-        return blezz::coeffForTime (retune / 1000.0 + humanize * held01 * 0.25, fs);
+        const double held01 = juce::jlimit (0.0, 1.0, (heldSeconds - 0.12) / 0.3);
+        return blezz::coeffForTime (retuneMs / 1000.0 + humanize * held01 * 0.25, fs);
     };
     float aShift = shiftCoeff();
-    const float aGrain = blezz::coeffForTime (0.03, fs);
-    const float aWet   = blezz::coeffForTime (0.02, fs);
-    const double minGrain = 0.022 * fs, maxGrain = 0.07 * fs;
+    const float aMix = blezz::coeffForTime (0.015, fs);
+    const float vibPass = vibAmt / (1.0f + retuneMs / 20.0f);   // con retune lento el vibrato ya pasa solo
+    const int histEvery = std::max (1, (int) (fs / 100.0));    // 100 puntos por segundo
     int samplesSinceUpdate = 0;
 
     float* ch0 = buffer.getWritePointer (0);
@@ -163,65 +181,84 @@ void BlezzTuneProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     for (int i = 0; i < n; ++i)
     {
-        float l = ch0[i];
-        float r = ch1 ? ch1[i] : l;
+        float x[2] = { ch0[i], ch1 ? ch1[i] : ch0[i] };
 
-        // ---------------- TUNE ----------------
+        // ---------------- DETECCIÓN ----------------
         ++samplesSinceUpdate;
-        if (tracker.push (0.5f * (l + r)))
+        if (tracker.push (numCh > 1 ? 0.5f * (x[0] + x[1]) : x[0]))
         {
-            const float f = tracker.getFrequency();
-            if (f > 0.0f)
+            const bool wasVoiced = voiced;
+            voiced = tracker.isVoiced();
+            if (voiced)
             {
+                const float f = tracker.getFrequency();
+                period = (float) (fs / f);
                 detectedMidi = 69.0f + 12.0f * std::log2 (f / 440.0f);
+                if (! wasVoiced || midiSlow < 0.0f) midiSlow = detectedMidi;
+                midiSlow += blezz::coeffForTime (0.18, fs / samplesSinceUpdate) * (detectedMidi - midiSlow);
+
                 const int note = nearestScaleNote (detectedMidi);
                 if (note != targetNote) { targetNote = note; heldSeconds = 0.0; }
                 else heldSeconds += samplesSinceUpdate / fs;
-                desiredShift = (float) targetNote - detectedMidi;
 
-                const double period = fs / f;
-                const double k = std::ceil (minGrain / (2.0 * period));
-                grainTarget = juce::jlimit (minGrain, maxGrain, 2.0 * k * period);
+                // Flex-Tune: solo corrige cuando ya estás cerca de la nota
+                float amount = 1.0f;
+                if (flex > 0.0f)
+                {
+                    const float devCents = std::abs (detectedMidi - (float) targetNote) * 100.0f;
+                    const float inner = 50.0f * (1.0f - flex);
+                    amount = juce::jlimit (0.0f, 1.0f, 1.0f - (devCents - inner) / 15.0f);
+                }
+                const float vib = detectedMidi - midiSlow;
+                desiredShift = amount * (((float) targetNote - detectedMidi) + vibPass * vib);
+
+                // inicio de nota: sin "scoop" desde la corrección anterior
+                if (! wasVoiced && retuneMs < 60.0f) shift = desiredShift;
             }
             else
             {
-                detectedMidi = -1.0f; targetNote = -1; heldSeconds = 0.0; desiredShift = 0.0f;
+                detectedMidi = -1.0f; targetNote = -1; heldSeconds = 0.0; midiSlow = -1.0f;
             }
             samplesSinceUpdate = 0;
             aShift = shiftCoeff();
         }
 
-        if (tuneOn)
-        {
-            shift += aShift * (desiredShift - shift);
-            grainLen += aGrain * (grainTarget - grainLen);
-            const float wetTarget = std::abs (shift) > 0.02f ? 1.0f : 0.0f;
-            wetAmount += aWet * (wetTarget - wetAmount);
+        if (voiced) shift += aShift * (desiredShift - shift);
+        const float ratio = std::pow (2.0f, shift / 12.0f);
 
-            shifter.advance (std::pow (2.0, shift / 12.0), grainLen);
-            const float sl = shifter.processSample (0, l);
-            const float sr = ch1 ? shifter.processSample (1, r) : sl;
-            shifter.endSample();
-            l += wetAmount * (sl - l);
-            r += wetAmount * (sr - r);
-        }
-        else
+        // ---------------- AFINACIÓN (PSOLA) ----------------
+        tuneMix += aMix * ((tuneOn ? 1.0f : 0.0f) - tuneMix);
+        psola.process (x, voiced && tuneOn, period, tuneOn ? ratio : 1.0f);
+        float l = x[0], r = numCh > 1 ? x[1] : x[0];
+        if (tuneMix < 0.999f)
         {
-            shift = 0.0f; wetAmount = 0.0f;
+            const float dl = psola.delayedDry (0), dr = numCh > 1 ? psola.delayedDry (1) : dl;
+            l = dl + tuneMix * (l - dl);
+            r = dr + tuneMix * (r - dr);
         }
 
-        // ---------------- COMPRESIÓN (FET -> OPTO, cadena clásica) ----------------
+        // ---------------- COMPRESIÓN (FET -> OPTO) ----------------
         if (fetOn)  { fet.process (l, r);  fetMax  = std::max (fetMax,  fet.getGainReduction()); }
         if (optoOn) { opto.process (l, r); optoMax = std::max (optoMax, opto.getGainReduction()); }
 
         // ---------------- BRILLO ----------------
         ch0[i] = bright.process (0, l);
         if (ch1) ch1[i] = bright.process (1, r);
+
+        // ---------------- HISTORIAL PARA EL GRÁFICO ----------------
+        if (++histCounter >= histEvery)
+        {
+            histCounter = 0;
+            const int w = histWrite.load (std::memory_order_relaxed);
+            histIn[(size_t) w]  = voiced ? detectedMidi : -1.0f;
+            histOut[(size_t) w] = voiced ? detectedMidi + (tuneOn ? shift : 0.0f) : -1.0f;
+            histWrite.store ((w + 1) % historySize, std::memory_order_release);
+        }
     }
 
-    uiDetectedMidi = detectedMidi;
-    uiTargetMidi   = (float) targetNote;
-    uiCorrection   = tuneOn ? shift * 100.0f : 0.0f;   // en cents
+    uiDetectedMidi = voiced ? detectedMidi : -1.0f;
+    uiTargetMidi   = voiced ? (float) targetNote : -1.0f;
+    uiCorrection   = tuneOn && voiced ? shift * 100.0f : 0.0f;
     uiFetGR  = fetMax;
     uiOptoGR = optoMax;
 }
@@ -246,6 +283,8 @@ void BlezzTuneProcessor::applyPreset (int index)
     set ("scale", (float) p.scale);
     set ("retune", p.retuneMs);
     set ("humanize", p.humanize);
+    set ("flex", p.flex);
+    set ("vibrato", p.vibrato);
     set ("fetOn", p.fetOn ? 1.0f : 0.0f);
     set ("fetIn", p.fetIn);   set ("fetOut", p.fetOut);
     set ("fetAtk", p.fetAtk); set ("fetRel", p.fetRel);

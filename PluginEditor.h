@@ -34,12 +34,18 @@ public:
     juce::Label* createSliderTextBox (juce::Slider&) override;
 };
 
-class NoteDisplay : public juce::Component
+// Gráfico de tono en vivo: entrada (tenue) vs salida afinada (brillante)
+class PitchGraph : public juce::Component
 {
 public:
-    void setValues (float detected, float target, float cents) { det = detected; tgt = target; corr = cents; repaint(); }
+    explicit PitchGraph (BlezzTuneProcessor& p) : proc (p) {}
+    void update();
     void paint (juce::Graphics&) override;
 private:
+    BlezzTuneProcessor& proc;
+    std::vector<float> in, out;
+    float centre = 60.0f, span = 7.0f;
+    bool first = true;
     float det = -1, tgt = -1, corr = 0;
 };
 
@@ -62,10 +68,9 @@ public:
 
     void paint (juce::Graphics&) override;
     void resized() override;
-
-private:
     void timerCallback() override;
 
+private:
     struct Knob
     {
         juce::Slider slider;
@@ -84,17 +89,17 @@ private:
     blezz::TrapLookAndFeel lnf;
 
     juce::ComboBox presetBox;
-    juce::ComboBox keyBox, scaleBox, ratioBox, modeBox;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> keyAtt, scaleAtt, ratioAtt, modeAtt;
+    juce::ComboBox keyBox, scaleBox, modeBox, ratioBox, optoModeBox;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> keyAtt, scaleAtt, modeAtt, ratioAtt, optoModeAtt;
     juce::ToggleButton tuneOn, fetOn, optoOn;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tuneOnAtt, fetOnAtt, optoOnAtt;
-    juce::Label keyLbl, scaleLbl, ratioLbl, modeLbl;
+    juce::Label keyLbl, scaleLbl, modeLbl, ratioLbl, optoModeLbl, latencyLbl;
 
-    Knob retune, humanize, fetIn, fetOut, fetAtk, fetRel, optoPeak, optoGain;
+    Knob retune, humanize, flex, vibrato, fetIn, fetOut, fetAtk, fetRel, optoPeak, optoGain;
     juce::Slider brillo;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> brilloAtt;
 
-    blezz::NoteDisplay noteDisplay;
+    blezz::PitchGraph graph;
     blezz::GRMeter fetMeter, optoMeter;
 
     juce::Rectangle<int> tunePanel, fetPanel, optoPanel, brilloPanel;

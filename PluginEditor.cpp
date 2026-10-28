@@ -154,65 +154,115 @@ static juce::String noteName (int midi)
     return juce::String (n[((midi % 12) + 12) % 12]) + juce::String (midi / 12 - 1);
 }
 
-void NoteDisplay::paint (juce::Graphics& g)
+
+void PitchGraph::update()
+{
+    const int N = BlezzTuneProcessor::historySize;
+    const int w = proc.histWrite.load (std::memory_order_acquire);
+    in.resize ((size_t) N); out.resize ((size_t) N);
+    for (int i = 0; i < N; ++i)
+    {
+        const int idx = (w + i) % N;    // del más viejo al más nuevo
+        in[(size_t) i]  = proc.histIn[(size_t) idx].load();
+        out[(size_t) i] = proc.histOut[(size_t) idx].load();
+    }
+    // zoom automático: encuadrar todo lo que se ve en pantalla
+    float lo = 1000.0f, hi = -1000.0f;
+    for (int i = 0; i < N; ++i)
+        for (float v : { in[(size_t) i], out[(size_t) i] })
+            if (v > 0.0f) { lo = std::min (lo, v); hi = std::max (hi, v); }
+    if (hi > lo)
+    {
+        const float c = 0.5f * (lo + hi);
+        const float sp = juce::jlimit (5.0f, 18.0f, 0.5f * (hi - lo) + 1.5f);
+        if (first) { centre = c; span = sp; first = false; }
+        centre += 0.2f * (c - centre);
+        span   += 0.2f * (sp - span);
+    }
+    det = proc.uiDetectedMidi.load(); tgt = proc.uiTargetMidi.load(); corr = proc.uiCorrection.load();
+    repaint();
+}
+
+void PitchGraph::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat().reduced (1.0f);
     g.setGradientFill (juce::ColourGradient (juce::Colour (0xff0d0717), r.getX(), r.getY(),
                                              juce::Colour (0xff05020a), r.getX(), r.getBottom(), false));
     g.fillRoundedRectangle (r, 12.0f);
+
+    auto plot = r.reduced (0, 12).withTrimmedLeft (38).withTrimmedRight (8);
+    auto yFor = [&] (float midi) { return plot.getCentreY() - (midi - centre) / span * plot.getHeight() * 0.5f; };
+
+    // líneas de notas (las de la escala resaltadas)
+    g.setFont (plainFont (10.0f));
+    for (int nn = (int) std::floor (centre - span); nn <= (int) std::ceil (centre + span); ++nn)
+    {
+        const float y = yFor ((float) nn);
+        if (y < plot.getY() || y > plot.getBottom()) continue;
+        const bool inScale = proc.isInScale (nn);
+        g.setColour (inScale ? col::border.withAlpha (0.9f) : col::track.withAlpha (0.45f));
+        g.drawHorizontalLine ((int) y, plot.getX(), plot.getRight());
+        const bool roomy = plot.getHeight() / (2.0f * span) > 9.0f;
+        const bool tonic = (((nn % 12) + 12) % 12) == (int) proc.apvts.getRawParameterValue ("key")->load();
+        if (inScale && (roomy || tonic))
+        {
+            g.setColour (col::dim);
+            g.drawText (noteName (nn), (int) r.getX() + 6, (int) y - 7, 32, 14, juce::Justification::centredLeft);
+        }
+    }
+
+    // curvas
+    const int N = (int) out.size();
+    auto drawCurve = [&] (const std::vector<float>& v, juce::Colour c, float thick, bool glow)
+    {
+        juce::Path p; bool open = false;
+        for (int i = 0; i < N; ++i)
+        {
+            const float x = plot.getX() + plot.getWidth() * (float) i / (float) (N - 1);
+            const float y = v[(size_t) i] > 0.0f ? yFor (v[(size_t) i]) : -1.0e6f;
+            if (y < plot.getY() - 2.0f || y > plot.getBottom() + 2.0f) { open = false; continue; }
+            if (! open) { p.startNewSubPath (x, y); open = true; }
+            else p.lineTo (x, y);
+        }
+        if (glow)
+        {
+            g.setColour (c.withAlpha (0.18f));
+            g.strokePath (p, juce::PathStrokeType (thick * 4.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+        g.setColour (c);
+        g.strokePath (p, juce::PathStrokeType (thick, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    };
+    if (N > 1)
+    {
+        drawCurve (in,  col::dim.withAlpha (0.8f), 1.4f, false);
+        drawCurve (out, col::accent2, 2.4f, true);
+    }
+
     g.setColour (col::border);
     g.drawRoundedRectangle (r, 12.0f, 1.0f);
 
-    const bool voiced = det >= 0.0f && tgt >= 0.0f;
-    auto top = r.withHeight (r.getHeight() * 0.62f);
-
-    g.setFont (boldFont (11.0f));
-    g.setColour (col::dim);
-    g.drawText ("NOTA", r.reduced (14, 10), juce::Justification::topLeft);
-
-    const juce::String big = voiced ? noteName ((int) tgt) : juce::String ("--");
-    g.setFont (boldFont (68.0f));
-    if (voiced)
-    {
-        g.setColour (col::accent.withAlpha (0.25f));
-        for (auto o : { -2.0f, 2.0f })
-            g.drawText (big, top.translated (o, o), juce::Justification::centred);
-    }
+    // nota actual + corrección
+    const bool voiced = det > 0.0f && tgt > 0.0f;
+    auto box = juce::Rectangle<float> (plot.getX() + 6, r.getY() + 10, 116, 66);
+    g.setColour (juce::Colour (0xcc07030c));
+    g.fillRoundedRectangle (box, 10.0f);
+    g.setColour (col::border);
+    g.drawRoundedRectangle (box, 10.0f, 1.0f);
+    g.setFont (boldFont (34.0f));
     g.setColour (voiced ? col::accent2 : col::dim.withAlpha (0.5f));
-    g.drawText (big, top, juce::Justification::centred);
-
-    // detectado
-    g.setFont (plainFont (12.5f));
+    g.drawText (voiced ? noteName ((int) tgt) : juce::String ("--"), box.withTrimmedBottom (20), juce::Justification::centred);
+    g.setFont (plainFont (11.0f));
     g.setColour (col::dim);
-    juce::String info = "entrada: ";
-    if (det >= 0.0f)
-    {
-        const int dn = (int) std::lround (det);
-        const int cents = (int) std::lround ((det - (float) dn) * 100.0f);
-        info << noteName (dn) << (cents >= 0 ? "  +" : "  ") << cents << "c";
-    }
-    else info << "--";
-    g.drawText (info, r.withTop (top.getBottom() - 6).withHeight (18), juce::Justification::centred);
+    juce::String info = voiced ? juce::String ((int) std::lround (corr)) + "c corr." : juce::String ("sin voz");
+    if (voiced && corr > 0) info = "+" + info;
+    g.drawText (info, box.withTrimmedTop (44), juce::Justification::centred);
 
-    // medidor de corrección (-100 .. +100 cents)
-    auto bar = juce::Rectangle<float> (r.getX() + 24, r.getBottom() - 30, r.getWidth() - 48, 8);
-    g.setColour (col::track);
-    g.fillRoundedRectangle (bar, 4.0f);
-    const float c = juce::jlimit (-100.0f, 100.0f, corr);
-    const float cx = bar.getCentreX();
-    const float px = cx + c / 100.0f * bar.getWidth() * 0.5f;
-    auto fill = juce::Rectangle<float> (std::min (cx, px), bar.getY(), std::abs (px - cx), bar.getHeight());
-    g.setColour (col::accent.withAlpha (0.3f));
-    g.fillRoundedRectangle (fill.expanded (2, 3), 5.0f);
-    g.setGradientFill (juce::ColourGradient (col::accent, cx, 0, col::accent2, px, 0, false));
-    g.fillRoundedRectangle (fill, 4.0f);
-    g.setColour (col::text);
-    g.fillRect (cx - 1.0f, bar.getY() - 4, 2.0f, bar.getHeight() + 8);
-    g.setFont (plainFont (10.0f));
+    // leyenda
+    g.setFont (boldFont (10.0f));
     g.setColour (col::dim);
-    g.drawText ("-100c", bar.translated (0, 10).withHeight (12), juce::Justification::centredLeft);
-    g.drawText ("CORRECCION", bar.translated (0, 10).withHeight (12), juce::Justification::centred);
-    g.drawText ("+100c", bar.translated (0, 10).withHeight (12), juce::Justification::centredRight);
+    g.drawText ("ENTRADA", (int) plot.getX() + 6, (int) r.getBottom() - 18, 60, 12, juce::Justification::centredLeft);
+    g.setColour (col::accent2);
+    g.drawText ("AFINADO", (int) plot.getX() + 66, (int) r.getBottom() - 18, 60, 12, juce::Justification::centredLeft);
 }
 
 void GRMeter::paint (juce::Graphics& g)
@@ -233,8 +283,9 @@ void GRMeter::paint (juce::Graphics& g)
     g.drawText (juce::String (-gr, 1) + " dB", bar.reduced (6, 0), juce::Justification::centredRight);
 }
 
+
 //==============================================================================
-BlezzTuneEditor::BlezzTuneEditor (BlezzTuneProcessor& p) : AudioProcessorEditor (&p), proc (p)
+BlezzTuneEditor::BlezzTuneEditor (BlezzTuneProcessor& p) : AudioProcessorEditor (&p), proc (p), graph (p)
 {
     setLookAndFeel (&lnf);
 
@@ -253,10 +304,11 @@ BlezzTuneEditor::BlezzTuneEditor (BlezzTuneProcessor& p) : AudioProcessorEditor 
     setupToggle (fetOn, fetOnAtt, "fetOn", "ON");
     setupToggle (optoOn, optoOnAtt, "optoOn", "ON");
 
+    setupCombo (modeBox, modeAtt, "mode", { "Estudio", "Tiempo Real" });
     setupCombo (keyBox, keyAtt, "key", BlezzTuneProcessor::keyNames());
     setupCombo (scaleBox, scaleAtt, "scale", BlezzTuneProcessor::scaleNames());
     setupCombo (ratioBox, ratioAtt, "fetRatio", { "4:1", "8:1", "12:1", "20:1", "ALL" });
-    setupCombo (modeBox, modeAtt, "optoMode", { "Compress", "Limit" });
+    setupCombo (optoModeBox, optoModeAtt, "optoMode", { "Compress", "Limit" });
 
     auto setupSmallLabel = [this] (juce::Label& l, const juce::String& t)
     {
@@ -265,10 +317,14 @@ BlezzTuneEditor::BlezzTuneEditor (BlezzTuneProcessor& p) : AudioProcessorEditor 
         l.setColour (juce::Label::textColourId, col::dim);
         addAndMakeVisible (l);
     };
+    setupSmallLabel (modeLbl, "MODO");
     setupSmallLabel (keyLbl, "TONALIDAD");
     setupSmallLabel (scaleLbl, "ESCALA");
     setupSmallLabel (ratioLbl, "RATIO");
-    setupSmallLabel (modeLbl, "MODO");
+    setupSmallLabel (optoModeLbl, "MODO");
+    setupSmallLabel (latencyLbl, "");
+    latencyLbl.setFont (plainFont (10.5f));
+    latencyLbl.setJustificationType (juce::Justification::centredRight);
 
     auto ms  = [] (double v) { return v < 0.5 ? juce::String ("0 ms") : juce::String ((int) v) + " ms"; };
     auto pct = [] (double v) { return juce::String ((int) std::lround (v)) + "%"; };
@@ -277,6 +333,8 @@ BlezzTuneEditor::BlezzTuneEditor (BlezzTuneProcessor& p) : AudioProcessorEditor 
 
     setupKnob (retune,   "retune",   "RETUNE SPEED", ms, true);
     setupKnob (humanize, "humanize", "HUMANIZE", pct);
+    setupKnob (flex,     "flex",     "FLEX-TUNE", pct);
+    setupKnob (vibrato,  "vibrato",  "VIBRATO", pct);
     setupKnob (fetIn,    "fetIn",    "INPUT", db);
     setupKnob (fetOut,   "fetOut",   "OUTPUT", db);
     setupKnob (fetAtk,   "fetAtk",   "ATTACK", one);
@@ -291,12 +349,12 @@ BlezzTuneEditor::BlezzTuneEditor (BlezzTuneProcessor& p) : AudioProcessorEditor 
     brillo.updateText();
     addAndMakeVisible (brillo);
 
-    addAndMakeVisible (noteDisplay);
+    addAndMakeVisible (graph);
     addAndMakeVisible (fetMeter);
     addAndMakeVisible (optoMeter);
 
     sendLookAndFeelChange();   // recrea las cajas de valor con el estilo trap
-    setSize (900, 580);
+    setSize (980, 660);
     startTimerHz (30);
 }
 
@@ -305,7 +363,6 @@ BlezzTuneEditor::~BlezzTuneEditor()
     stopTimer();
     setLookAndFeel (nullptr);
 }
-
 void BlezzTuneEditor::setupKnob (Knob& k, const juce::String& id, const juce::String& name,
                                  std::function<juce::String (double)> fmt, bool big)
 {
@@ -364,6 +421,7 @@ static void drawPanel (juce::Graphics& g, juce::Rectangle<int> area, const juce:
     g.drawText (title, (int) r.getX() + 30, (int) r.getY() + 10, 220, 20, juce::Justification::centredLeft);
 }
 
+
 void BlezzTuneEditor::paint (juce::Graphics& g)
 {
     auto b = getLocalBounds().toFloat();
@@ -372,22 +430,23 @@ void BlezzTuneEditor::paint (juce::Graphics& g)
 
     // brillos morados de fondo
     g.setGradientFill (juce::ColourGradient (col::accent.withAlpha (0.28f), 120, 40,
-                                             col::accent.withAlpha (0.0f), 520, 260, true));
+                                             col::accent.withAlpha (0.0f), 560, 300, true));
     g.fillAll();
     g.setGradientFill (juce::ColourGradient (col::accent2.withAlpha (0.12f), b.getRight() - 80, b.getBottom() - 40,
-                                             col::accent2.withAlpha (0.0f), b.getRight() - 480, b.getBottom() - 300, true));
+                                             col::accent2.withAlpha (0.0f), b.getRight() - 520, b.getBottom() - 320, true));
     g.fillAll();
 
     // marca de agua 777
     g.setColour (col::accent.withAlpha (0.05f));
-    g.setFont (boldFont (190.0f));
-    g.drawText ("777", getLocalBounds().withTrimmedTop (250).translated (240, 0), juce::Justification::centred);
+    g.setFont (boldFont (200.0f));
+    g.drawText ("777", getLocalBounds().withTrimmedTop (300).translated (250, 0), juce::Justification::centred);
 
     // logo
     g.setFont (boldFont (36.0f));
     const juce::String a = "BLEZZ", t = " TUNE";
     const int x0 = 22, y0 = 14;
     const int aw = juce::GlyphArrangement::getStringWidthInt (boldFont (36.0f), a);
+    const int tw = juce::GlyphArrangement::getStringWidthInt (boldFont (36.0f), t);
     g.setColour (col::accent.withAlpha (0.35f));
     g.drawText (a + t, x0 + 1, y0 + 2, 400, 42, juce::Justification::centredLeft);
     g.setColour (juce::Colours::white);
@@ -395,9 +454,17 @@ void BlezzTuneEditor::paint (juce::Graphics& g)
     g.setGradientFill (juce::ColourGradient (col::accent2, (float) (x0 + aw), 0, col::accent, (float) (x0 + aw + 120), 0, false));
     g.drawText (t, x0 + aw, y0, 300, 40, juce::Justification::centredLeft);
 
+    // insignia V2
+    auto badge = juce::Rectangle<float> ((float) (x0 + aw + tw + 10), (float) y0 + 9, 36, 22);
+    g.setGradientFill (juce::ColourGradient (col::accent, badge.getX(), 0, col::accent2, badge.getRight(), 0, false));
+    g.fillRoundedRectangle (badge, 6.0f);
+    g.setColour (juce::Colours::white);
+    g.setFont (boldFont (14.0f));
+    g.drawText ("V2", badge, juce::Justification::centred);
+
     g.setFont (boldFont (10.5f));
     g.setColour (col::dim);
-    g.drawText ("VOCAL SUITE  /  TRAP EDITION  /  777", x0 + 2, y0 + 40, 400, 16, juce::Justification::centredLeft);
+    g.drawText ("PSOLA VOCAL SUITE  /  TRAP EDITION  /  777", x0 + 2, y0 + 40, 420, 16, juce::Justification::centredLeft);
 
     g.drawText ("PRESET", getWidth() - 330, 30, 60, 20, juce::Justification::centredLeft);
 
@@ -411,52 +478,67 @@ void BlezzTuneEditor::resized()
 {
     presetBox.setBounds (getWidth() - 270, 24, 250, 32);
 
-    tunePanel   = { 16, 88, 868, 210 };
-    fetPanel    = { 16, 310, 400, 254 };
-    optoPanel   = { 426, 310, 300, 254 };
-    brilloPanel = { 736, 310, 148, 254 };
+    tunePanel   = { 16, 88, 948, 282 };
+    fetPanel    = { 16, 382, 440, 262 };
+    optoPanel   = { 466, 382, 320, 262 };
+    brilloPanel = { 796, 382, 168, 262 };
 
-    // TUNE
+    // AUTO TUNE
     {
         const int x = tunePanel.getX(), y = tunePanel.getY();
         tuneOn.setBounds (x + 16, y + 40, 110, 24);
-        keyLbl.setBounds (x + 14, y + 76, 150, 16);
-        keyBox.setBounds (x + 16, y + 94, 156, 30);
-        scaleLbl.setBounds (x + 14, y + 132, 150, 16);
-        scaleBox.setBounds (x + 16, y + 150, 156, 30);
-        noteDisplay.setBounds (x + 190, y + 14, 330, 182);
-        placeKnob (retune, { x + 535, y + 14, 180, 190 });
-        placeKnob (humanize, { x + 720, y + 40, 140, 160 });
+        modeLbl.setBounds  (x + 14, y + 74, 150, 16);
+        modeBox.setBounds  (x + 16, y + 92, 156, 30);
+        keyLbl.setBounds   (x + 14, y + 130, 150, 16);
+        keyBox.setBounds   (x + 16, y + 148, 156, 30);
+        scaleLbl.setBounds (x + 14, y + 186, 150, 16);
+        scaleBox.setBounds (x + 16, y + 204, 156, 30);
+        latencyLbl.setBounds (x + 14, y + 240, 160, 30);
+        latencyLbl.setJustificationType (juce::Justification::centredLeft);
+
+        graph.setBounds (x + 190, y + 14, 450, 254);
+
+        const int kx = x + 650, kw = 145, kh = 130;
+        placeKnob (retune,   { kx,      y + 10,      kw, kh });
+        placeKnob (humanize, { kx + kw, y + 10,      kw, kh });
+        placeKnob (flex,     { kx,      y + 12 + kh, kw, kh });
+        placeKnob (vibrato,  { kx + kw, y + 12 + kh, kw, kh });
     }
     // FET 76
     {
         const int x = fetPanel.getX(), y = fetPanel.getY();
         fetOn.setBounds (fetPanel.getRight() - 90, y + 9, 80, 24);
         Knob* ks[] = { &fetIn, &fetOut, &fetAtk, &fetRel };
-        for (int i = 0; i < 4; ++i) placeKnob (*ks[i], { x + 6 + i * 97, y + 42, 96, 134 });
-        ratioLbl.setBounds (x + 14, y + 184, 80, 16);
-        ratioBox.setBounds (x + 16, y + 202, 118, 30);
-        fetMeter.setBounds (x + 150, y + 205, fetPanel.getWidth() - 168, 24);
+        for (int i = 0; i < 4; ++i) placeKnob (*ks[i], { x + 8 + i * 106, y + 42, 104, 140 });
+        ratioLbl.setBounds (x + 14, y + 190, 80, 16);
+        ratioBox.setBounds (x + 16, y + 208, 118, 30);
+        fetMeter.setBounds (x + 152, y + 211, fetPanel.getWidth() - 170, 24);
     }
     // OPTO 2A
     {
         const int x = optoPanel.getX(), y = optoPanel.getY();
         optoOn.setBounds (optoPanel.getRight() - 90, y + 9, 80, 24);
-        placeKnob (optoPeak, { x + 8, y + 42, 140, 134 });
-        placeKnob (optoGain, { x + 152, y + 42, 140, 134 });
-        modeLbl.setBounds (x + 14, y + 184, 80, 16);
-        modeBox.setBounds (x + 16, y + 202, 118, 30);
-        optoMeter.setBounds (x + 146, y + 205, optoPanel.getWidth() - 162, 24);
+        placeKnob (optoPeak, { x + 8,   y + 42, 150, 140 });
+        placeKnob (optoGain, { x + 162, y + 42, 150, 140 });
+        optoModeLbl.setBounds (x + 14, y + 190, 80, 16);
+        optoModeBox.setBounds (x + 16, y + 208, 118, 30);
+        optoMeter.setBounds (x + 146, y + 211, optoPanel.getWidth() - 162, 24);
     }
     // BRILLO
-    brillo.setBounds (brilloPanel.getX() + 30, brilloPanel.getY() + 42, 88, 200);
+    brillo.setBounds (brilloPanel.getX() + 40, brilloPanel.getY() + 42, 88, 206);
 }
 
 void BlezzTuneEditor::timerCallback()
 {
-    noteDisplay.setValues (proc.uiDetectedMidi.load(), proc.uiTargetMidi.load(), proc.uiCorrection.load());
+    graph.update();
     fetMeter.setGR (proc.apvts.getRawParameterValue ("fetOn")->load() > 0.5f ? proc.uiFetGR.load() : 0.0f);
     optoMeter.setGR (proc.apvts.getRawParameterValue ("optoOn")->load() > 0.5f ? proc.uiOptoGR.load() : 0.0f);
+
+    const double sr = proc.getSampleRate() > 0 ? proc.getSampleRate() : 48000.0;
+    const bool rt = proc.apvts.getRawParameterValue ("mode")->load() > 0.5f;
+    latencyLbl.setText (rt ? "Baja latencia: para grabar\nescuchandote en vivo"
+                           : "Maxima calidad  (" + juce::String (juce::roundToInt (proc.getLatencySamples() * 1000.0 / sr)) + " ms,\nFL lo compensa solo)",
+                        juce::dontSendNotification);
 
     const int p = proc.currentPresetAtomic.load();
     if (p != lastPreset)
