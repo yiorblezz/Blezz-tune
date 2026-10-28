@@ -31,8 +31,8 @@ juce_add_plugin(BlezzTune
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
 target_sources(BlezzTune PRIVATE
-    Source/PluginProcessor.cpp
-    Source/PluginEditor.cpp)
+    PluginProcessor.cpp
+    PluginEditor.cpp)
 
 target_compile_definitions(BlezzTune PUBLIC
     JUCE_WEB_BROWSER=0
